@@ -1,0 +1,228 @@
+local M = {}
+
+-- State to track windows and buffers
+local state = {
+  wins = {},
+  bufs = {}
+}
+
+local default_opts = {
+  files = {
+    "~/notes/todo.md",
+    "~/notes/pending.md",
+    "~/notes/done.md",
+  },
+  target_file = nil,
+  border = "single",
+  width = 0.8,
+  height = 0.8,
+}
+
+local function expand_path(path)
+  if path:sub(1, 1) == "~" then
+    return os.getenv("HOME") .. path:sub(2)
+  end
+  return path
+end
+
+local function get_win_config(index, opts)
+  local screen_w = vim.o.columns
+  local screen_h = vim.o.lines
+
+  local total_width = math.floor(screen_w * opts.width)
+  local total_height = math.floor(screen_h * opts.height)
+  local win_width = math.floor(total_width / 3)
+
+  local start_col = math.floor((screen_w - total_width) / 2)
+  local row = math.floor((screen_h - total_height) / 2)
+  local col = start_col + ((index - 1) * win_width)
+
+  return {
+    relative = "editor",
+    width = win_width - 2,
+    height = total_height,
+    col = col,
+    row = row,
+    border = opts.border,
+    style = "minimal",
+  }
+end
+
+-- Helper: Get current window index (1, 2, or 3)
+local function get_current_win_index()
+  local current_win = vim.api.nvim_get_current_win()
+  for i, win in ipairs(state.wins) do
+    if win == current_win then return i end
+  end
+  return nil
+end
+
+-- Helper: Save a specific buffer
+local function save_buffer(buf)
+  if buf and vim.api.nvim_buf_is_valid(buf) then
+    vim.api.nvim_buf_call(buf, function()
+      vim.cmd("silent! write")
+    end)
+  end
+end
+
+-- 1. Navigation Logic (Focus)
+local function navigate(direction)
+  local idx = get_current_win_index()
+  if not idx then return end
+
+  local next_idx
+  if direction == "next" then
+    next_idx = (idx % 3) + 1
+  elseif direction == "prev" then
+    next_idx = ((idx - 2) % 3) + 1
+  end
+
+  local target_win = state.wins[next_idx]
+  if target_win and vim.api.nvim_win_is_valid(target_win) then
+    vim.api.nvim_set_current_win(target_win)
+  end
+end
+
+-- 2. Move Line Logic (Left/Right between windows)
+local function move_line_circular(direction)
+  local idx = get_current_win_index()
+  if not idx then return end
+
+  local current_buf = state.bufs[idx]
+  local line_text = vim.api.nvim_get_current_line()
+
+  if line_text == "" then return end -- Skip empty lines
+
+  -- Delete from current
+  vim.api.nvim_del_current_line()
+  save_buffer(current_buf) -- Autosave source
+
+  -- Determine target
+  local target_idx
+  if direction == "next" then
+    target_idx = (idx % 3) + 1
+  elseif direction == "prev" then
+    target_idx = ((idx - 2) % 3) + 1
+  end
+
+  local target_buf = state.bufs[target_idx]
+
+  -- Append to target
+  if target_buf and vim.api.nvim_buf_is_valid(target_buf) then
+    vim.api.nvim_buf_set_lines(target_buf, -1, -1, false, { line_text })
+    save_buffer(target_buf) -- Autosave target
+  end
+end
+
+-- 3. Reorder Logic (Up/Down within same window)
+local function move_line_vertical(direction)
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_win_get_buf(win)
+  local cursor = vim.api.nvim_win_get_cursor(win) -- {row, col}
+  local row = cursor[1]                           -- 1-based index
+  local total_lines = vim.api.nvim_buf_line_count(buf)
+
+  if direction == "up" then
+    if row > 1 then
+      -- Swap with line above
+      local line_curr = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1]
+      local line_above = vim.api.nvim_buf_get_lines(buf, row - 2, row - 1, false)[1]
+
+      vim.api.nvim_buf_set_lines(buf, row - 2, row, false, { line_curr, line_above })
+      vim.api.nvim_win_set_cursor(win, { row - 1, cursor[2] })
+      save_buffer(buf)
+    end
+  elseif direction == "down" then
+    if row < total_lines then
+      -- Swap with line below
+      local line_curr = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1]
+      local line_below = vim.api.nvim_buf_get_lines(buf, row, row + 1, false)[1]
+
+      vim.api.nvim_buf_set_lines(buf, row - 1, row + 1, false, { line_below, line_curr })
+      vim.api.nvim_win_set_cursor(win, { row + 1, cursor[2] })
+      save_buffer(buf)
+    end
+  end
+end
+
+local function close_all_windows()
+  -- Even with autosave, we check just in case
+  for _, buf in ipairs(state.bufs) do
+    if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_option_value("modified", { buf = buf }) then
+      -- Force save on close if still modified
+      save_buffer(buf)
+    end
+  end
+  for _, win in ipairs(state.wins) do
+    if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
+  end
+  state.wins = {}
+  state.bufs = {}
+end
+
+local function open_floating_files(opts)
+  if #state.wins > 0 and vim.api.nvim_win_is_valid(state.wins[1]) then
+    vim.api.nvim_set_current_win(state.wins[1])
+    return
+  end
+
+  state.wins = {}
+  state.bufs = {}
+
+  local files_to_open = opts.files
+  -- Backwards compat check
+  if opts.target_file and opts.files == default_opts.files then
+    files_to_open = { opts.target_file, "~/notes/pending.md", "~/notes/done.md" }
+  end
+
+  for i = 1, 3 do
+    local path = files_to_open[i] or "~/notes/scratch_" .. i .. ".md"
+    local expanded_path = expand_path(path)
+
+    local buf = vim.fn.bufnr(expanded_path, true)
+    if buf == -1 then
+      buf = vim.api.nvim_create_buf(false, false)
+      vim.api.nvim_buf_set_name(buf, expanded_path)
+    end
+
+    if not vim.api.nvim_buf_is_loaded(buf) then vim.fn.bufload(buf) end
+    vim.bo[buf].swapfile = false
+
+    local win = vim.api.nvim_open_win(buf, true, get_win_config(i, opts))
+
+    table.insert(state.wins, win)
+    table.insert(state.bufs, buf)
+
+    -- --- KEYMAPS ---
+    local map_opts = { noremap = true, silent = true, buffer = buf }
+
+    -- Navigation (Arrows)
+    vim.keymap.set('n', '<Right>', function() navigate("next") end, map_opts)
+    vim.keymap.set('n', '<Left>', function() navigate("prev") end, map_opts)
+
+    -- Move Text (Ctrl + Arrows) -> Circular
+    vim.keymap.set('n', '<C-Right>', function() move_line_circular("next") end, map_opts)
+    vim.keymap.set('n', '<C-Left>', function() move_line_circular("prev") end, map_opts)
+
+    -- Move Text (Ctrl + Up/Down) -> Reorder
+    vim.keymap.set('n', '<C-Up>', function() move_line_vertical("up") end, map_opts)
+    vim.keymap.set('n', '<C-Down>', function() move_line_vertical("down") end, map_opts)
+
+    -- Close (q)
+    vim.keymap.set('n', 'q', function() close_all_windows() end, map_opts)
+  end
+
+  vim.api.nvim_set_current_win(state.wins[2])
+end
+
+local function setup_user_commands(opts)
+  opts = vim.tbl_deep_extend("force", default_opts, opts or {})
+  vim.api.nvim_create_user_command("Td", function() open_floating_files(opts) end, {})
+end
+
+M.setup = function(opts)
+  setup_user_commands(opts)
+end
+
+return M

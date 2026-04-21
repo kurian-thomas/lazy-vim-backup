@@ -1,0 +1,166 @@
+local M = {}
+
+-- State to track the 3 windows and buffers
+local state = {
+  wins = {},
+  bufs = {}
+}
+
+local default_opts = {
+  -- We now accept a list of 3 files
+  files = {
+    "~/notes/todo.md",
+    "~/notes/pending.md",
+    "~/notes/done.md",
+  },
+  border = "single",
+  height = 0.8,
+}
+
+local function expand_path(path)
+  if path:sub(1, 1) == "~" then
+    return os.getenv("HOME") .. path:sub(2)
+  end
+  return path
+end
+
+-- Calculate layout for 3 columns
+local function get_win_config(index, opts)
+  local screen_w = vim.o.columns
+  local screen_h = vim.o.lines
+
+  -- Calculate width for 3 windows with a little spacing
+  -- roughly 1/3rd of screen each
+  local width = math.floor((screen_w * 0.9) / 3)
+  local height = math.floor(screen_h * opts.height)
+
+  -- Calculate starting X position to center the group
+  local total_group_width = width * 3
+  local start_col = (screen_w - total_group_width) / 2
+
+  -- Position for the specific window (index 1, 2, or 3)
+  local col = start_col + ((index - 1) * width)
+  local row = (screen_h - height) / 2
+
+  return {
+    relative = "editor",
+    width = width - 2, -- Subtract 2 for borders to prevent overlap visually
+    height = height,
+    col = col,
+    row = row,
+    border = opts.border,
+    style = "minimal",
+  }
+end
+
+local function close_all_windows()
+  -- Check for unsaved changes in any of the buffers
+  for _, buf in ipairs(state.bufs) do
+    if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_option_value("modified", { buf = buf }) then
+      vim.notify("Unsaved changes in one of the files. Please save first.", vim.log.levels.WARN)
+      return
+    end
+  end
+
+  -- Close all windows
+  for _, win in ipairs(state.wins) do
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end
+
+  -- Reset state
+  state.wins = {}
+  state.bufs = {}
+end
+
+local function navigate(direction)
+  local current_win = vim.api.nvim_get_current_win()
+
+  -- Find current index
+  local current_idx = 1
+  for i, win in ipairs(state.wins) do
+    if win == current_win then
+      current_idx = i
+      break
+    end
+  end
+
+  -- Circular Logic
+  local next_idx
+  if direction == "next" then
+    next_idx = (current_idx % 3) + 1
+  elseif direction == "prev" then
+    next_idx = ((current_idx - 2) % 3) + 1
+  end
+
+  local target_win = state.wins[next_idx]
+  if target_win and vim.api.nvim_win_is_valid(target_win) then
+    vim.api.nvim_set_current_win(target_win)
+  end
+end
+
+local function open_floating_files(opts)
+  -- If windows exist, focus the first one instead of reopening
+  if #state.wins > 0 and vim.api.nvim_win_is_valid(state.wins[1]) then
+    vim.api.nvim_set_current_win(state.wins[1])
+    return
+  end
+
+  -- Reset state
+  state.wins = {}
+  state.bufs = {}
+
+  for i = 1, 3 do
+    local path = opts.files[i] or "~/notes/scratch_" .. i .. ".md" -- Fallback if not enough files provided
+    local expanded_path = expand_path(path)
+
+    -- Get or Create Buffer
+    local buf = vim.fn.bufnr(expanded_path, true)
+    if buf == -1 then
+      buf = vim.api.nvim_create_buf(false, false)
+      vim.api.nvim_buf_set_name(buf, expanded_path)
+    end
+
+    -- Ensure buffer is loaded
+    if not vim.api.nvim_buf_is_loaded(buf) then
+      vim.fn.bufload(buf)
+    end
+
+    vim.bo[buf].swapfile = false
+
+    -- Create Window
+    local win_conf = get_win_config(i, opts)
+    local win = vim.api.nvim_open_win(buf, true, win_conf)
+
+    table.insert(state.wins, win)
+    table.insert(state.bufs, buf)
+
+    -- --- KEYMAPS ---
+
+    -- Circular Navigation (Left/Right Arrows)
+    local nav_opts = { noremap = true, silent = true }
+    vim.keymap.set('n', '<Right>', function() navigate("next") end, { buffer = buf })
+    vim.keymap.set('n', '<Left>', function() navigate("prev") end, { buffer = buf })
+
+    -- Close all (q)
+    vim.keymap.set('n', 'q', function() close_all_windows() end, { buffer = buf })
+  end
+
+  -- Start focus on the middle window (optional, can change to 1)
+  vim.api.nvim_set_current_win(state.wins[2])
+end
+
+local function setup_user_commands(opts)
+  opts = vim.tbl_deep_extend("force", default_opts, opts or {})
+
+  vim.api.nvim_create_user_command("Td", function()
+    open_floating_files(opts)
+  end, {})
+end
+
+M.setup = function(opts)
+  setup_user_commands(opts)
+end
+
+return M
